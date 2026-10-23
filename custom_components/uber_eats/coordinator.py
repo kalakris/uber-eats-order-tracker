@@ -4,11 +4,12 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_AUTH_COOKIE,
     CONF_FULL_COOKIE,
     CONF_SESSION_ID,
     CONF_SID,
@@ -36,6 +37,7 @@ from .const import (
     DEFAULT_TTS_VOLUME,
     DEFAULT_TTS_INTERVAL_MINUTES,
 )
+from .session_refresh import async_refresh_session, format_cookie_header, parse_cookie_header
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +55,18 @@ _DURABLE_COOKIE_NAMES = (
 _EPHEMERAL_COOKIE_NAMES = ("__cf_bm",)
 
 
+# Uber answers an expired sid with HTTP 200 and this message, not a 401.
+_SESSION_EXPIRED_MESSAGES = ("NO_USER_UUID",)
+# Do not hammer auth.uber.com if a renewal keeps failing.
+_REFRESH_RETRY_AFTER = timedelta(minutes=30)
+# Failed renewals (network, Cloudflare) before giving up and asking for a new login.
+_MAX_REFRESH_FAILURES = 6
+
+
+class SessionExpired(ConfigEntryAuthFailed):
+    """The ubereats.com session is gone; a renewal may bring it back."""
+
+
 def _no_driver(driver_name):
     return driver_name in ("No Driver Assigned", "Unknown", None, "")
 
@@ -62,13 +76,16 @@ def _has_driver(driver_name):
 
 
 class UberEatsCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, entry_id, sid, session_id, account_name, time_zone, full_cookie=None):
+    def __init__(self, hass, entry_id, sid, session_id, account_name, time_zone, full_cookie=None, auth_cookie=None):
         self.entry_id = entry_id
         self.sid = sid
         self.session_id = session_id  # Renamed from uuid
         self.account_name = account_name
         self.time_zone = time_zone
         self.full_cookie = full_cookie  # Full cookie for APIs that need it
+        self.auth_cookie = auth_cookie  # auth.uber.com login, used to renew the session
+        self._last_refresh_attempt = None
+        self._refresh_failures = 0
         self.hass = hass
         self._order_history = []  # Per-account history
         self._previous_data = None  # Set on first update
@@ -147,21 +164,82 @@ class UberEatsCoordinator(DataUpdateCoordinator):
 
         self.full_cookie = "; ".join(f"{key}={value}" for key, value in jar.items())
         try:
-            entry = self.hass.config_entries.async_get_entry(self.entry_id)
-            if entry:
-                self.hass.config_entries.async_update_entry(
-                    entry,
-                    data={
-                        **entry.data,
-                        CONF_SID: self.sid,
-                        CONF_SESSION_ID: self.session_id,
-                        CONF_FULL_COOKIE: self.full_cookie,
-                    },
-                )
+            self._persist_cookies()
         except Exception as err:
             _LOGGER.debug("Failed to persist rotated cookies: %s", err)
 
+    def _persist_cookies(self):
+        entry = self.hass.config_entries.async_get_entry(self.entry_id)
+        if entry:
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_SID: self.sid,
+                    CONF_SESSION_ID: self.session_id,
+                    CONF_FULL_COOKIE: self.full_cookie,
+                    CONF_AUTH_COOKIE: self.auth_cookie,
+                },
+            )
+
+    async def _async_refresh_session(self):
+        """Renew the ubereats.com session from the auth.uber.com login.
+
+        Returns "ok", "retry" (worth another try later) or "reauth" (needs the user).
+        """
+        if not self.auth_cookie:
+            return "reauth"
+        now = dt_util.utcnow()
+        if self._last_refresh_attempt and now - self._last_refresh_attempt < _REFRESH_RETRY_AFTER:
+            return "retry"
+        self._last_refresh_attempt = now
+
+        result = await async_refresh_session(
+            format_cookie_header(self._stored_cookie_jar()), self.auth_cookie, HEADERS_TEMPLATE
+        )
+        # csid rotates even on a failed renewal; losing it would end the auth login.
+        self.auth_cookie = result.auth_cookie
+        if result.eats_cookie:
+            jar = parse_cookie_header(result.eats_cookie)
+            for name in _EPHEMERAL_COOKIE_NAMES:
+                jar.pop(name, None)
+            self.full_cookie = format_cookie_header(jar)
+            self.sid = jar.get("sid", self.sid)
+            self.session_id = jar.get("uev2.id.session", self.session_id)
+            self._ephemeral_cookies = {}
+            self._consecutive_auth_failures = 0
+        try:
+            self._persist_cookies()
+        except Exception as err:
+            _LOGGER.error("Failed to persist renewed Uber cookies: %s", err)
+
+        if result.error:
+            self._refresh_failures += 1
+            _LOGGER.warning(
+                "Uber Eats session renewal failed (%s/%s): %s",
+                self._refresh_failures, _MAX_REFRESH_FAILURES, result.error,
+            )
+            if result.login_expired or self._refresh_failures >= _MAX_REFRESH_FAILURES:
+                return "reauth"
+            return "retry"
+        self._refresh_failures = 0
+        _LOGGER.info("Renewed the Uber Eats session from the auth.uber.com login")
+        return "ok"
+
     async def _async_update_data(self):
+        try:
+            return await self._async_fetch_data()
+        except SessionExpired as err:
+            outcome = await self._async_refresh_session()
+            if outcome == "reauth":
+                raise
+            if outcome == "retry":
+                # UpdateFailed keeps polling; ConfigEntryAuthFailed would stop it for good.
+                raise UpdateFailed(f"{err} Session renewal will be retried.") from err
+            _LOGGER.debug("Retrying after session renewal (was: %s)", err)
+            return await self._async_fetch_data()
+
+    async def _async_fetch_data(self):
         # Systematically poll user profile on every update to detect changes
         try:
             profile = await self.fetch_user_profile()
@@ -203,7 +281,7 @@ class UberEatsCoordinator(DataUpdateCoordinator):
                     if resp.status in (401, 403):
                         self._consecutive_auth_failures += 1
                         if self._consecutive_auth_failures >= 3:
-                            raise ConfigEntryAuthFailed(
+                            raise SessionExpired(
                                 "Session expired. Please reconfigure with new cookies."
                             )
                         _LOGGER.warning(
@@ -225,10 +303,16 @@ class UberEatsCoordinator(DataUpdateCoordinator):
                     data = await resp.json()
                     
                     # Check for auth errors in response body
+                    if data.get("status") == "failure":
+                        error_msg = (data.get("data") or {}).get("message", "")
+                        if error_msg in _SESSION_EXPIRED_MESSAGES:
+                            raise SessionExpired(
+                                f"Session expired ({error_msg}). Please reconfigure with new cookies."
+                            )
                     if "error" in data:
                         error_code = data.get("error", {}).get("code", "")
                         if error_code in ("UNAUTHORIZED", "SESSION_EXPIRED", "INVALID_TOKEN"):
-                            raise ConfigEntryAuthFailed(
+                            raise SessionExpired(
                                 f"Authentication error: {error_code}"
                             )
                     

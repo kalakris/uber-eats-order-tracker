@@ -6,31 +6,37 @@
         "description": "Connect your Uber Eats account. Your account name will be fetched automatically from your profile.",
         "data": {
           "time_zone": "Time Zone",
-          "cookie": "Cookie String"
+          "cookie": "Cookie String",
+          "auth_cookie": "auth.uber.com Cookies"
         },
         "data_description": {
           "time_zone": "Must match Home Assistant's time zone.",
-          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → refresh page → click any request → copy 'Cookie' header value."
+          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → refresh page → click any request → copy 'Cookie' header value.",
+          "auth_cookie": "Optional, lets the integration renew the session itself instead of asking for a new cookie every month. In DevTools → Application → Cookies → https://auth.uber.com, copy the values as 'sid=...; csid=...; smeta=...'. Best taken from a separate login (a private window you close without logging out), because each renewal replaces csid."
         }
       },
       "reconfigure": {
         "title": "Reconfigure Uber Eats",
         "description": "Update cookie for account: {account_name}",
         "data": {
-          "cookie": "Cookie String"
+          "cookie": "Cookie String",
+          "auth_cookie": "auth.uber.com Cookies"
         },
         "data_description": {
-          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → copy 'Cookie' header."
+          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → copy 'Cookie' header.",
+          "auth_cookie": "Optional, lets the integration renew the session itself instead of asking for a new cookie every month. In DevTools → Application → Cookies → https://auth.uber.com, copy the values as 'sid=...; csid=...; smeta=...'. Best taken from a separate login (a private window you close without logging out), because each renewal replaces csid. Leave blank to keep the stored one."
         }
       },
       "reauth_confirm": {
         "title": "Session Expired",
         "description": "Your Uber Eats session has expired for account: {account_name}. Please provide a fresh cookie.",
         "data": {
-          "cookie": "Cookie String"
+          "cookie": "Cookie String",
+          "auth_cookie": "auth.uber.com Cookies"
         },
         "data_description": {
-          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → copy 'Cookie' header."
+          "cookie": "Full cookie string from ubereats.com. Open DevTools (F12) → Network tab → copy 'Cookie' header.",
+          "auth_cookie": "Optional, lets the integration renew the session itself instead of asking for a new cookie every month. In DevTools → Application → Cookies → https://auth.uber.com, copy the values as 'sid=...; csid=...; smeta=...'. Best taken from a separate login (a private window you close without logging out), because each renewal replaces csid. Leave blank to keep the stored one."
         }
       }
     },
@@ -47,7 +53,9 @@
       "invalid_session": "Invalid session format.",
       "invalid_time_zone": "Select your Home Assistant time zone.",
       "invalid_credentials": "Unable to validate credentials. Cookie may be expired or invalid.",
-      "unknown_error": "An unexpected error occurred. Check logs for details."
+      "unknown_error": "An unexpected error occurred. Check logs for details.",
+      "auth_csid_not_found": "Could not find 'csid' in the auth.uber.com cookies. It is on the auth.uber.com host, not ubereats.com.",
+      "auth_sid_not_found": "Could not find 'sid' in the auth.uber.com cookies."
     }
   }
 }

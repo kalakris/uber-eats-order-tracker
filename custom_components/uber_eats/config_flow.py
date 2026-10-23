@@ -14,6 +14,7 @@ from .const import (
     CONF_SID,
     CONF_SESSION_ID,
     CONF_FULL_COOKIE,
+    CONF_AUTH_COOKIE,
     CONF_ACCOUNT_NAME,
     CONF_TIME_ZONE,
     ENDPOINT,
@@ -21,6 +22,7 @@ from .const import (
     ENDPOINT_GET_USER,
     HEADERS_TEMPLATE,
 )
+from .session_refresh import auth_cookie_problem
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +115,17 @@ def _validate_cookie_string(cookie_string: str) -> tuple[str | None, dict[str, s
         return ("invalid_session", {})
     
     return (None, parsed)
+
+
+def _read_auth_cookie(user_input: dict, errors: dict, existing: str | None = None) -> str | None:
+    """Optional auth.uber.com cookie; blank keeps the stored one."""
+    auth_cookie = user_input.get(CONF_AUTH_COOKIE, "").strip()
+    if not auth_cookie:
+        return existing
+    problem = auth_cookie_problem(auth_cookie)
+    if problem:
+        errors[CONF_AUTH_COOKIE] = problem
+    return auth_cookie
 
 
 def _get_locale_code(tz: str) -> str:
@@ -211,6 +224,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             cookie_err, parsed = _validate_cookie_string(cookie_string)
             if cookie_err:
                 errors[CONF_COOKIE] = cookie_err
+            auth_cookie = _read_auth_cookie(user_input, errors)
 
             # If fields pass, try a live refresh to validate creds
             if not errors:
@@ -240,6 +254,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                                     CONF_SID: parsed["sid"],
                                     CONF_SESSION_ID: parsed["session_id"],
                                     CONF_FULL_COOKIE: cookie_string,
+                                    CONF_AUTH_COOKIE: auth_cookie,
                                     CONF_ACCOUNT_NAME: account_name,
                                     CONF_TIME_ZONE: ha_tz,
                                 },
@@ -252,6 +267,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             {
                 vol.Required(CONF_TIME_ZONE, default=ha_tz): vol.In(TIME_ZONES),
                 vol.Required(CONF_COOKIE): str,
+                vol.Optional(CONF_AUTH_COOKIE, default=""): str,
             }
         )
 
@@ -275,6 +291,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             cookie_err, parsed = _validate_cookie_string(cookie_string)
             if cookie_err:
                 errors[CONF_COOKIE] = cookie_err
+            auth_cookie = _read_auth_cookie(user_input, errors, entry.data.get(CONF_AUTH_COOKIE))
 
             if not errors:
                 is_valid = await _validate_credentials(
@@ -291,6 +308,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             CONF_SID: parsed["sid"],
                             CONF_SESSION_ID: parsed["session_id"],
                             CONF_FULL_COOKIE: cookie_string,
+                            CONF_AUTH_COOKIE: auth_cookie,
                         },
                     )
                 errors["base"] = "invalid_credentials"
@@ -299,6 +317,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=vol.Schema({
                 vol.Required(CONF_COOKIE): str,
+                vol.Optional(CONF_AUTH_COOKIE, default=""): str,
             }),
             errors=errors,
             description_placeholders={
@@ -326,6 +345,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             cookie_err, parsed = _validate_cookie_string(cookie_string)
             if cookie_err:
                 errors[CONF_COOKIE] = cookie_err
+            auth_cookie = _read_auth_cookie(user_input, errors, entry.data.get(CONF_AUTH_COOKIE))
 
             if not errors:
                 is_valid = await _validate_credentials(
@@ -342,6 +362,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             CONF_SID: parsed["sid"],
                             CONF_SESSION_ID: parsed["session_id"],
                             CONF_FULL_COOKIE: cookie_string,
+                            CONF_AUTH_COOKIE: auth_cookie,
                         },
                     )
                 errors["base"] = "invalid_credentials"
@@ -350,6 +371,7 @@ class UberEatsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="reauth_confirm",
             data_schema=vol.Schema({
                 vol.Required(CONF_COOKIE): str,
+                vol.Optional(CONF_AUTH_COOKIE, default=""): str,
             }),
             errors=errors,
             description_placeholders={
