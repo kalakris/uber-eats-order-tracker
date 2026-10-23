@@ -46,6 +46,10 @@ def eats_app(port):
             resp.set_cookie("smeta", "EATS-SMETA-NEW", domain="ubereats.com")
             resp.del_cookie("state", domain="www.ubereats.com")
             raise resp
+        if request.cookies.get("sid") == "EATS-EXPIRED":
+            resp = web.HTTPFound(f"http://auth.uber.com:{port}/v2/?state=S1&refresh=true")
+            resp.set_cookie("state", "S1", domain="www.ubereats.com", max_age=900)
+            raise resp
         return web.Response(text="home")
 
     async def feed(request):
@@ -76,6 +80,7 @@ def auth_app(port):
 
 async def main():
     app = web.Application()
+    hits = []
     # Both fake hosts share one server; dispatch on the Host header.
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -85,6 +90,7 @@ async def main():
     auth_srv.add_routes(auth_app(port))
 
     async def dispatch(request):
+        hits.append(request.path)
         target = auth_srv if request.host.startswith("auth.") else eats_srv
         match = await target.router.resolve(request)
         return await match.handler(request)
@@ -126,6 +132,17 @@ async def main():
         assert r.eats_cookie is None and r.login_expired and "login page" in r.error, r
         assert sr.parse_cookie_header(r.auth_cookie)["csid"] == "CSID/1="
         print("ok: expired auth login ->", r.error)
+
+        # 3. An expired sid: the home page itself starts the refresh=true chain.
+        AUTH_LOGGED_IN["csid"] = "CSID/1="
+        hits.clear()
+        sr.aiohttp.ClientSession = functools.partial(
+            real_session, connector=aiohttp.TCPConnector(resolver=LocalResolver())
+        )
+        r = await sr.async_refresh_session(eats_cookie.replace("EATS-OLD", "EATS-EXPIRED"), auth_cookie, headers)
+        assert r.error is None, r.error
+        assert hits == ["/", "/v2/", "/", "/feed"], hits
+        print("ok: home page refresh=true chain")
     finally:
         sr.aiohttp.ClientSession = real_session
         await runner.cleanup()

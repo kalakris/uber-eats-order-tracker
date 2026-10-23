@@ -22,7 +22,7 @@ _LOGGER = logging.getLogger(__name__)
 
 EATS_URL = URL("https://www.ubereats.com/")
 AUTH_URL = URL("https://auth.uber.com/")
-# Starts the auth.uber.com hop whether or not the current session is valid.
+# Starts the auth.uber.com hop whenever the sid is no longer valid.
 LOGIN_REDIRECT_URL = URL("https://www.ubereats.com/login-redirect/")
 
 # Cookies auth.uber.com scopes to its own host; the rest of the login lives on .uber.com.
@@ -101,8 +101,10 @@ async def async_refresh_session(
     login_expired = False
     try:
         async with aiohttp.ClientSession(cookie_jar=jar) as session:
-            # Fallback: the home page, which the browser was seen to redirect once the sid expired.
-            for start in (LOGIN_REDIRECT_URL, EATS_URL):
+            # The home page first: with an expired sid it sends a browser through
+            # auth.uber.com with refresh=true, which also extends the 180-day login.
+            # /login-redirect/ reaches auth.uber.com in every case but does not extend it.
+            for start in (EATS_URL, LOGIN_REDIRECT_URL):
                 async with session.get(
                     start,
                     headers=request_headers,
