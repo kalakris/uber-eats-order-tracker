@@ -93,9 +93,11 @@ class UberEatsCoordinator(DataUpdateCoordinator):
         # streak and the retry limiter over from the last recorded attempt.
         entry = hass.config_entries.async_get_entry(entry_id)
         last = (entry.data.get(CONF_LAST_RENEWAL) if entry else None) or {}
-        if last and not last.get("ok"):
+        last_at = dt_util.parse_datetime(last.get("at") or "") if last else None
+        # A streak whose last attempt is over six hours old belongs to an earlier expiry.
+        if last_at and not last.get("ok") and dt_util.utcnow() - last_at < _REFRESH_RETRY_AFTER * 12:
             self._refresh_failures = int(last.get("failures") or 0)
-            self._last_refresh_attempt = dt_util.parse_datetime(last.get("at") or "")
+            self._last_refresh_attempt = last_at
         self.hass = hass
         self._order_history = []  # Per-account history
         self._previous_data = None  # Set on first update
