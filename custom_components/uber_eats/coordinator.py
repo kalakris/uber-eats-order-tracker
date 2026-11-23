@@ -10,7 +10,6 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    DOMAIN,
     CONF_AUTH_COOKIE,
     CONF_LAST_RENEWAL,
     CONF_FULL_COOKIE,
@@ -89,6 +88,14 @@ class UberEatsCoordinator(DataUpdateCoordinator):
         self.auth_cookie = auth_cookie  # auth.uber.com login, used to renew the session
         self._last_refresh_attempt = None
         self._refresh_failures = 0
+        self._renewal_path = None
+        # Restarts and setup retries build a new coordinator: carry the failure
+        # streak and the retry limiter over from the last recorded attempt.
+        entry = hass.config_entries.async_get_entry(entry_id)
+        last = (entry.data.get(CONF_LAST_RENEWAL) if entry else None) or {}
+        if last and not last.get("ok"):
+            self._refresh_failures = int(last.get("failures") or 0)
+            self._last_refresh_attempt = dt_util.parse_datetime(last.get("at") or "")
         self.hass = hass
         self._order_history = []  # Per-account history
         self._previous_data = None  # Set on first update
@@ -187,10 +194,9 @@ class UberEatsCoordinator(DataUpdateCoordinator):
 
     def _abort_reauth_flows(self):
         """Close a reauth prompt that an earlier failed renewal left open."""
-        flows = self.hass.config_entries.flow.async_progress_by_handler(DOMAIN)
-        for flow in flows:
-            context = flow.get("context") or {}
-            if context.get("source") == SOURCE_REAUTH and context.get("entry_id") == self.entry_id:
+        entry = self.hass.config_entries.async_get_entry(self.entry_id)
+        if entry:
+            for flow in entry.async_get_active_flows(self.hass, {SOURCE_REAUTH}):
                 self.hass.config_entries.flow.async_abort(flow["flow_id"])
 
     async def _async_refresh_session(self):
@@ -219,16 +225,23 @@ class UberEatsCoordinator(DataUpdateCoordinator):
             self.session_id = jar.get("uev2.id.session", self.session_id)
             self._ephemeral_cookies = {}
             self._consecutive_auth_failures = 0
+        self._renewal_path = result.path
         if result.error:
-            self._refresh_failures += 1
-        else:
-            self._refresh_failures = 0
+            # A login page alone is not final: it has been seen to pass on a later try.
+            return self._record_renewal_failure(result.error)
+        try:
+            self._persist_cookies()
+        except Exception as err:
+            _LOGGER.error("Failed to persist renewed Uber cookies: %s", err)
+        return "ok"
+
+    def _record_renewal(self, ok, error=None):
         # Kept in the entry so the last outcome can be checked without debug logs.
         renewal = {
-            "at": now.isoformat(),
-            "ok": not result.error,
-            "path": result.path,
-            "error": result.error,
+            "at": (self._last_refresh_attempt or dt_util.utcnow()).isoformat(),
+            "ok": ok,
+            "path": self._renewal_path,
+            "error": error,
             "failures": self._refresh_failures,
         }
         try:
@@ -236,21 +249,17 @@ class UberEatsCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error("Failed to persist renewed Uber cookies: %s", err)
 
-        if result.error:
-            _LOGGER.warning(
-                "Uber Eats session renewal failed (%s/%s): %s",
-                self._refresh_failures, _MAX_REFRESH_FAILURES, result.error,
-            )
-            # A login page alone is not final: it has been seen to pass on a later try.
-            if self._refresh_failures >= _MAX_REFRESH_FAILURES:
-                return "reauth"
-            return "retry"
-        _LOGGER.info("Renewed the Uber Eats session from the auth.uber.com login via %s", result.path)
-        try:
-            self._abort_reauth_flows()
-        except Exception as err:
-            _LOGGER.debug("Could not close the reauth prompt: %s", err)
-        return "ok"
+    def _record_renewal_failure(self, error):
+        """Count a failed renewal; return "retry" or, after too many, "reauth"."""
+        self._refresh_failures += 1
+        self._record_renewal(False, error)
+        _LOGGER.warning(
+            "Uber Eats session renewal failed (%s/%s): %s",
+            self._refresh_failures, _MAX_REFRESH_FAILURES, error,
+        )
+        if self._refresh_failures >= _MAX_REFRESH_FAILURES:
+            return "reauth"
+        return "retry"
 
     async def _async_update_data(self):
         try:
@@ -263,7 +272,21 @@ class UberEatsCoordinator(DataUpdateCoordinator):
                 # UpdateFailed keeps polling; ConfigEntryAuthFailed would stop it for good.
                 raise UpdateFailed(f"{err} Session renewal will be retried.") from err
             _LOGGER.debug("Retrying after session renewal (was: %s)", err)
-            return await self._async_fetch_data()
+            try:
+                data = await self._async_fetch_data()
+            except SessionExpired as again:
+                # The new cookies were not accepted after all.
+                if self._record_renewal_failure(f"renewed session rejected: {again}") == "reauth":
+                    raise
+                raise UpdateFailed(f"{again} Session renewal will be retried.") from again
+            self._refresh_failures = 0
+            self._record_renewal(True)
+            _LOGGER.info("Renewed the Uber Eats session via %s", self._renewal_path)
+            try:
+                self._abort_reauth_flows()
+            except Exception as reauth_err:
+                _LOGGER.warning("Could not close the Uber Eats reauth prompt: %s", reauth_err)
+            return data
 
     async def _async_fetch_data(self):
         # Systematically poll user profile on every update to detect changes
