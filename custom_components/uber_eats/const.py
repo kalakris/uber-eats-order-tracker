@@ -10,6 +10,7 @@ CONF_SID = "sid"
 CONF_SESSION_ID = "session_id"
 CONF_FULL_COOKIE = "full_cookie"  # Full cookie string for APIs that need it
 CONF_AUTH_COOKIE = "auth_cookie"  # auth.uber.com login cookies, renew the session
+CONF_LAST_RENEWAL = "last_session_renewal"  # outcome of the last renewal attempt
 
 # TTS notification settings (stored in config entry options, managed via panel UI)
 CONF_TTS_ENABLED = "tts_enabled"

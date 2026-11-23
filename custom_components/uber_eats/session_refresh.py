@@ -38,7 +38,8 @@ class RefreshResult:
     eats_cookie: str | None  # None when the renewal failed
     auth_cookie: str  # always returned: csid may have rotated either way
     error: str | None = None
-    login_expired: bool = False  # auth.uber.com wants a password: retrying will not help
+    login_expired: bool = False  # every start URL ended on the auth.uber.com login page
+    path: str | None = None  # the start URL that worked
 
 
 def parse_cookie_header(header: str | None) -> dict[str, str]:
@@ -97,14 +98,17 @@ async def async_refresh_session(
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    error = None
-    login_expired = False
-    try:
-        async with aiohttp.ClientSession(cookie_jar=jar) as session:
-            # The home page first: with an expired sid it sends a browser through
-            # auth.uber.com with refresh=true, which also extends the 180-day login.
-            # /login-redirect/ reaches auth.uber.com in every case but does not extend it.
-            for start in (EATS_URL, LOGIN_REDIRECT_URL):
+    outcomes = []  # one line per start URL, for the error message
+    login_pages = 0
+    path = None
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        # The home page first: with an expired sid it sends a browser through
+        # auth.uber.com with refresh=true, which can also extend the 180-day login.
+        # /login-redirect/ reaches auth.uber.com in every case. Either can answer
+        # with a login page on one try and work on the next, so a login page on
+        # one start does not end the attempt.
+        for start in (EATS_URL, LOGIN_REDIRECT_URL):
+            try:
                 async with session.get(
                     start,
                     headers=request_headers,
@@ -115,15 +119,18 @@ async def async_refresh_session(
                     hops = [str(r.url.host) for r in resp.history] + [str(resp.url.host)]
                     _LOGGER.debug("Session refresh from %s: %s -> %s", start.path, hops, resp.status)
                     if resp.url.host == AUTH_URL.host:
-                        login_expired = True
-                        error = "auth.uber.com showed its login page: the auth login has expired"
-                        break
+                        login_pages += 1
+                        outcomes.append(f"{start.path}: auth.uber.com login page")
+                        continue
                     if any(r.url.host == AUTH_URL.host for r in resp.history):
-                        error = None
+                        path = start.path
                         break
-                    error = f"never reached auth.uber.com (hops {hops}, status {resp.status})"
-    except Exception as err:  # network errors, too many redirects
-        error = f"{type(err).__name__}: {err}"
+                    outcomes.append(f"{start.path}: never reached auth.uber.com (hops {hops}, status {resp.status})")
+            except Exception as err:  # network errors, too many redirects
+                outcomes.append(f"{start.path}: {type(err).__name__}: {err}")
+
+    error = None if path else "; ".join(outcomes)
+    login_expired = login_pages == len(outcomes) == 2
 
     auth_out = {**auth_in, **_read(jar, AUTH_URL)}
     eats_out = {**eats_in, **_read(jar, EATS_URL)}
@@ -140,4 +147,5 @@ async def async_refresh_session(
         auth_cookie=format_cookie_header(auth_out),
         error=error,
         login_expired=login_expired,
+        path=path,
     )

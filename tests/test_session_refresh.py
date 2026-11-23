@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "custom_compone
 import session_refresh as sr  # noqa: E402
 
 AUTH_LOGGED_IN = {"csid": "CSID/1="}  # the csid auth.uber.com currently accepts
+REFRESH_SHOWS_LOGIN = {"on": False}  # auth.uber.com answers refresh=true with its login page
 
 
 class LocalResolver(AbstractResolver):
@@ -63,6 +64,8 @@ def eats_app(port):
 def auth_app(port):
     async def v2(request):
         csid = request.cookies.get("csid")
+        if REFRESH_SHOWS_LOGIN["on"] and request.query.get("refresh") == "true":
+            return web.Response(text="login page")
         if csid != AUTH_LOGGED_IN["csid"]:
             return web.Response(text="login page")
         # One sid per domain: a duplicate .uber.com / host-only sid would be ambiguous.
@@ -129,7 +132,7 @@ async def main():
             real_session, connector=aiohttp.TCPConnector(resolver=LocalResolver())
         )
         r = await sr.async_refresh_session(eats_cookie, auth_cookie, headers)
-        assert r.eats_cookie is None and r.login_expired and "login page" in r.error, r
+        assert r.eats_cookie is None and "login page" in r.error, r
         assert sr.parse_cookie_header(r.auth_cookie)["csid"] == "CSID/1="
         print("ok: expired auth login ->", r.error)
 
@@ -143,6 +146,27 @@ async def main():
         assert r.error is None, r.error
         assert hits == ["/", "/v2/", "/", "/feed"], hits
         print("ok: home page refresh=true chain")
+
+        # 4. refresh=true shows a login page (seen on 2026-11-22); /login-redirect/ still works.
+        AUTH_LOGGED_IN["csid"] = "CSID/1="
+        REFRESH_SHOWS_LOGIN["on"] = True
+        hits.clear()
+        sr.aiohttp.ClientSession = functools.partial(
+            real_session, connector=aiohttp.TCPConnector(resolver=LocalResolver())
+        )
+        r = await sr.async_refresh_session(eats_cookie.replace("EATS-OLD", "EATS-EXPIRED"), auth_cookie, headers)
+        assert r.error is None and r.path == "/login-redirect/", r
+        assert hits == ["/", "/v2/", "/login-redirect/", "/v2/", "/", "/feed"], hits
+        print("ok: login page on refresh=true falls back to /login-redirect/")
+
+        # 5. Both paths show a login page: the only case flagged as login_expired.
+        AUTH_LOGGED_IN["csid"] = "SOMETHING-ELSE"
+        sr.aiohttp.ClientSession = functools.partial(
+            real_session, connector=aiohttp.TCPConnector(resolver=LocalResolver())
+        )
+        r = await sr.async_refresh_session(eats_cookie.replace("EATS-OLD", "EATS-EXPIRED"), auth_cookie, headers)
+        assert r.eats_cookie is None and r.login_expired, r
+        print("ok: both paths on the login page ->", r.error)
     finally:
         sr.aiohttp.ClientSession = real_session
         await runner.cleanup()

@@ -5,11 +5,14 @@ import logging
 import os
 from datetime import datetime, timedelta
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    DOMAIN,
     CONF_AUTH_COOKIE,
+    CONF_LAST_RENEWAL,
     CONF_FULL_COOKIE,
     CONF_SESSION_ID,
     CONF_SID,
@@ -168,19 +171,27 @@ class UberEatsCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.debug("Failed to persist rotated cookies: %s", err)
 
-    def _persist_cookies(self):
+    def _persist_cookies(self, renewal=None):
         entry = self.hass.config_entries.async_get_entry(self.entry_id)
         if entry:
-            self.hass.config_entries.async_update_entry(
-                entry,
-                data={
-                    **entry.data,
-                    CONF_SID: self.sid,
-                    CONF_SESSION_ID: self.session_id,
-                    CONF_FULL_COOKIE: self.full_cookie,
-                    CONF_AUTH_COOKIE: self.auth_cookie,
-                },
-            )
+            data = {
+                **entry.data,
+                CONF_SID: self.sid,
+                CONF_SESSION_ID: self.session_id,
+                CONF_FULL_COOKIE: self.full_cookie,
+                CONF_AUTH_COOKIE: self.auth_cookie,
+            }
+            if renewal is not None:
+                data[CONF_LAST_RENEWAL] = renewal
+            self.hass.config_entries.async_update_entry(entry, data=data)
+
+    def _abort_reauth_flows(self):
+        """Close a reauth prompt that an earlier failed renewal left open."""
+        flows = self.hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        for flow in flows:
+            context = flow.get("context") or {}
+            if context.get("source") == SOURCE_REAUTH and context.get("entry_id") == self.entry_id:
+                self.hass.config_entries.flow.async_abort(flow["flow_id"])
 
     async def _async_refresh_session(self):
         """Renew the ubereats.com session from the auth.uber.com login.
@@ -208,22 +219,37 @@ class UberEatsCoordinator(DataUpdateCoordinator):
             self.session_id = jar.get("uev2.id.session", self.session_id)
             self._ephemeral_cookies = {}
             self._consecutive_auth_failures = 0
+        if result.error:
+            self._refresh_failures += 1
+        else:
+            self._refresh_failures = 0
+        # Kept in the entry so the last outcome can be checked without debug logs.
+        renewal = {
+            "at": now.isoformat(),
+            "ok": not result.error,
+            "path": result.path,
+            "error": result.error,
+            "failures": self._refresh_failures,
+        }
         try:
-            self._persist_cookies()
+            self._persist_cookies(renewal)
         except Exception as err:
             _LOGGER.error("Failed to persist renewed Uber cookies: %s", err)
 
         if result.error:
-            self._refresh_failures += 1
             _LOGGER.warning(
                 "Uber Eats session renewal failed (%s/%s): %s",
                 self._refresh_failures, _MAX_REFRESH_FAILURES, result.error,
             )
-            if result.login_expired or self._refresh_failures >= _MAX_REFRESH_FAILURES:
+            # A login page alone is not final: it has been seen to pass on a later try.
+            if self._refresh_failures >= _MAX_REFRESH_FAILURES:
                 return "reauth"
             return "retry"
-        self._refresh_failures = 0
-        _LOGGER.info("Renewed the Uber Eats session from the auth.uber.com login")
+        _LOGGER.info("Renewed the Uber Eats session from the auth.uber.com login via %s", result.path)
+        try:
+            self._abort_reauth_flows()
+        except Exception as err:
+            _LOGGER.debug("Could not close the reauth prompt: %s", err)
         return "ok"
 
     async def _async_update_data(self):
